@@ -1,0 +1,13 @@
+on:
+  [delete]
+jobs:
+  trigger-circleci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: branch_event
+        id: be
+        uses: CircleCI-Public/trigger-circleci-pipeline-action@v1.0.5
+        with:
+          GHA_Meta: ${{ github.event.ref }}
+        env:
+          CCI_TOKEN: ${{ secrets.CIRCLECI_TOKEN }}

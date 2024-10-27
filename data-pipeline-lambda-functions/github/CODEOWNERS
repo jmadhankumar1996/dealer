@@ -1,0 +1,6 @@
+# Setting default codeowners to default as reviewers
+*   @silvercar/business-intelligence
+
+# DevOps specific domains
+.circleci/ @silvercar/devops
+terraform/ @silvercar/devops

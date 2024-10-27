@@ -1,0 +1,442 @@
+# TODO: need to figure out how to modify pipeline for releasing multiple Lambda functions
+#       currently we are only releasing one lambda function for Volvo infleet
+---
+version: 2.1
+
+orbs:
+  dvo-tfc: silvercar/dvo-tools-tfc@0.7.0
+  aws-cli: circleci/aws-cli@4.1.0
+  aws-ecr: circleci/aws-ecr@9.0.0
+  releaser: silvercar/releaser@1.7.0
+  terraform: circleci/terraform@3.2.1
+  slack: circleci/slack@4.13.3
+
+commits_to_main_filter: &commits_to_main_filter
+  branches:
+    only: main
+
+tags_only_filter: &tags_only_filter
+  tags:
+    only: /v.*/
+  branches:
+    ignore: /.*/
+
+parameters:
+  terraform_directory:
+    type: string
+    default: "./terraform"
+  tfc_app_branch:
+    type: string
+    default: <<#pipeline.git.tag>>do-not-release-tag<</pipeline.git.tag>><< pipeline.git.branch >>
+  tfc_dev_project_name:
+    type: string
+    default: "Silvercar"
+  tfc_prd_project_name:
+    type: string
+    default: "dw-prd"
+  tfc_tf_version:
+    type: string
+    description: "Terraform version to use. Defaults to latest."
+    default: ""
+  tfc_tst_project_name:
+    type: string
+    default: "Silvercar"
+  tfc_workspace_prefix:
+    type: string
+    default: "data-pipeline-lambda-functions"  # Replace with service or repo name.
+
+  ###################
+  # DO NOT FILL OUT #
+  ###################
+  # Used by GitHub Actions to pass information about GitHub events.
+  GHA_Event:
+    type: string
+    default: ""
+  GHA_Actor:
+    type: string
+    default: ""
+  GHA_Action:
+    type: string
+    default: ""
+  GHA_Meta:
+    type: string
+    default: ""
+
+executors:
+  node:
+    docker:
+      - image: cimg/node:18.19
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: install dependencies
+          command: |
+            pip install -r ./lambda/volvo-infleet/requirements.txt
+            pip install pylint
+      - run:
+          name: Lint
+          command: |
+            echo "Linting code"
+            # Full lint to show all errors and warnings
+            export PYLINT_FULL=$(pylint --recursive=y lambda/)
+            echo -e "$PYLINT_FULL"
+            # Partial lint to show and exit only on errors
+            pylint --errors-only --recursive=y lambda/
+  persist-tf-env-vars:
+    parameters:
+      image_tag:
+        default: "latest"
+        type: string
+      env:
+        default: ''
+        type: string
+    docker:
+      - image: cimg/base:2023.09
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Save Terraform ENV Vars
+          environment:
+            ENV: <<parameters.env>>
+          command: |
+            echo "export TF_VAR_env=$ENV_NAME" >> "$BASH_ENV"
+            
+            # TODO: we need to figure out how to parameterize the lambda functions for release.
+            echo "export TF_VAR_image_tag=<< parameters.image_tag >>" >> "$BASH_ENV"
+            cat $BASH_ENV >> bash.env
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bash.env
+  publish-image:
+    parameters:
+      function_name:
+        type: string
+      image_tag:
+        type: string
+    machine:
+      image: ubuntu-2404:2024.05.1
+    steps:
+      - aws-ecr/build_and_push_image:
+          repo: "data/pipeline-lambda-functions"
+          tag: << parameters.function_name >>-<< parameters.image_tag >>
+          dockerfile: Dockerfile
+          path: lambda/<< parameters.function_name >>/
+          platform: linux/amd64
+          profile_name: publish-image
+          extra_build_args: --provenance=false
+          auth:
+            - aws-cli/setup:
+                role_arn: ${AWS_IAM_ROLE}
+                profile_name: publish-image
+  release:
+    docker:
+      - image: cimg/node:22.4.1
+    steps:
+      - checkout
+      - run:
+          name: Install Semantic Release
+          command: sudo npm i -g semantic-release@24.0.0 @semantic-release/changelog@6.0.3 @semantic-release/git@10.0.1
+      - run:
+          name: Semantic Release
+          command: npx semantic-release
+  notify-release:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - releaser/create_existing_tag_release_info
+      - releaser/github_diff_link
+      - releaser/contributors
+      - releaser/jira_tickets
+      - releaser/notification:
+          slack_channel: release-coordination
+          version: $CIRCLE_TAG
+  notify-deploy:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - slack/notify:
+          event: always
+          channel: releases
+          template: DATA_PIPELINE_RELEASE_MESSAGE
+
+workflows:
+  version: 2
+  # Feature branch flow.  Note that we currently do not release code to a feature branch environment,
+  # the CI steps are only for code linting and Terraform plan (feature-branch workflow) for tst env (plan-tst
+  # workflow).
+  feature-branch:
+    when:
+      and:
+        - not:
+            matches:
+              pattern: /^main$/
+              value: << pipeline.git.branch >>
+        - not:
+            matches:
+              pattern: /^delete$/
+              value: << pipeline.parameters.GHA_Event >>
+    jobs:
+      - lint:
+          name: lint-dev
+      ### START OF CODE TO BE REMOVED ###
+      # Remove the following lines up to the end of the block before raising PR
+      - publish-image:
+          context:
+            - data-pipeline-lambda-functions-tst
+          function_name: "volvo-infleet"
+          image_tag: "${CIRCLE_SHA1}"
+          name: publish-image-dev
+          requires:
+            - lint-dev
+      - terraform/fmt:
+          checkout: true
+          name: terraform-fmt-tst
+          path: terraform
+          requires:
+            - publish-image-dev
+      - dvo-tfc/setup:
+          context:
+            - dvo-tools-tfc
+          name: setup-tst
+          tfc_app_branch: << pipeline.parameters.tfc_app_branch >>
+          tfc_app_name: << pipeline.parameters.tfc_workspace_prefix >>
+          tfc_env: "tst"
+          tfc_project: << pipeline.parameters.tfc_tst_project_name >>
+          tfc_vars_file: "env/tst.tfvars"
+          requires:
+            - terraform-fmt-tst
+      - persist-tf-env-vars:
+          name: persist-tf-env-vars-tst
+          image_tag: "${CIRCLE_SHA1}"
+          env: tst
+          requires:
+            - setup-tst
+      - dvo-tfc/init-plan:
+          context:
+            - dvo-tools-tfc
+          name: init-plan-tst
+          requires:
+            - persist-tf-env-vars-tst
+      - approve-feature-apply:
+          type: approval
+          requires:
+            - init-plan-tst
+      - dvo-tfc/apply:
+          context:
+            - dvo-tools-tfc
+          name: apply-tst
+          requires:
+            - approve-feature-apply
+      ### END OF CODE TO BE REMOVED ###
+  destroy-feature:
+    when:
+      and:
+        - equal: ["delete", << pipeline.parameters.GHA_Event >>]
+        - not:
+            matches:
+              pattern: /^main$/
+              value: << pipeline.parameters.GHA_Meta >>
+    jobs:
+      - persist-tf-env-vars:
+          name: persist-tf-env-vars-dev-destroy
+          image_tag: "${CIRCLE_SHA1}"
+          env: "dev"
+  plan-tst:
+    when:
+      and:
+        - not:
+            matches:
+              pattern: /^main$/
+              value: << pipeline.git.branch >>
+        - not:
+            matches:
+              pattern: /^delete$/
+              value: << pipeline.parameters.GHA_Event >>
+    jobs:
+      - terraform/fmt:
+          name: terraform-fmt-tst
+          checkout: true
+          path: terraform
+      - dvo-tfc/setup:
+          context:
+            - dvo-tools-tfc
+            - data-pipeline-lambda-functions-tst
+          name: setup-tst
+          tfc_app_branch: "main"
+          tfc_app_name: << pipeline.parameters.tfc_workspace_prefix >>
+          tfc_env: "tst"
+          tfc_project: << pipeline.parameters.tfc_tst_project_name >>
+          tfc_vars_file: "env/tst.tfvars"
+          requires:
+            - terraform-fmt-tst
+      - persist-tf-env-vars:
+          name: persist-tf-env-vars-tst
+          image_tag: "${CIRCLE_SHA1}"
+          env: "tst"
+          requires:
+            - setup-tst
+      - dvo-tfc/init-plan:
+          name: init-plan-tst
+          context:
+            - dvo-tools-tfc
+            - data-pipeline-lambda-functions-tst
+          requires:
+            - persist-tf-env-vars-tst
+  non-prod:
+    when:
+      and:
+        - matches:
+            pattern: /^main$/
+            value: << pipeline.git.branch >>
+        - not:
+            matches:
+              pattern: /^delete$/
+              value: << pipeline.parameters.GHA_Event >>
+    jobs:
+      - lint:
+          name: lint-tst
+      - publish-image:
+          context:
+            - data-pipeline-lambda-functions-tst
+          function_name: "volvo-infleet"
+          image_tag: "${CIRCLE_SHA1}"
+          name: publish-image-tst
+          requires:
+            - lint-tst
+      - terraform/fmt:
+          checkout: true
+          name: terraform-fmt-tst
+          path: terraform
+          requires:
+            - publish-image-tst
+      - dvo-tfc/setup:
+          context:
+            - dvo-tools-tfc
+          name: setup-tst
+          tfc_app_branch: "main"
+          tfc_app_name: << pipeline.parameters.tfc_workspace_prefix >>
+          tfc_env: "tst"
+          tfc_project: << pipeline.parameters.tfc_tst_project_name >>
+          tfc_vars_file: "env/tst.tfvars"
+          requires:
+            - terraform-fmt-tst
+      - persist-tf-env-vars:
+          name: persist-tf-env-vars-tst
+          image_tag: "${CIRCLE_SHA1}"
+          env: tst
+          requires:
+            - setup-tst
+      - dvo-tfc/init-plan:
+          context:
+            - dvo-tools-tfc
+          name: init-plan-tst
+          requires:
+            - persist-tf-env-vars-tst
+      - dvo-tfc/apply:
+          context:
+            - dvo-tools-tfc
+          name: apply-tst
+          requires:
+            - init-plan-tst
+  prod:
+    when:
+      not: << pipeline.parameters.GHA_Action >>
+    jobs:
+      - approve-tag-release:
+          type: approval
+          filters:
+            <<: *commits_to_main_filter
+      - release:
+          context:
+            - circleci-github-token
+          name: create-prd-release-tag
+          requires:
+            - approve-tag-release
+          filters:
+            <<: *commits_to_main_filter
+      # Note: publish image is only done by the non-prod role and not the prod role.
+      - publish-image:
+          context:
+            - data-pipeline-lambda-functions-tst
+          function_name: "volvo-infleet"
+          image_tag: "${CIRCLE_TAG}"
+          name: publish-image-prd
+          filters:
+            <<: *tags_only_filter
+      - terraform/fmt:
+          checkout: true
+          name: terraform-fmt-prd
+          path: terraform
+          requires:
+            - publish-image-prd
+          filters:
+            <<: *tags_only_filter
+      - dvo-tfc/setup:
+          context:
+            - dvo-tools-tfc
+          name: setup-prd
+          tfc_app_branch: "main"
+          tfc_app_name: << pipeline.parameters.tfc_workspace_prefix >>
+          tfc_env: "prd"
+          tfc_project: << pipeline.parameters.tfc_prd_project_name >>
+          tfc_vars_file: "env/prd.tfvars"
+          requires:
+            - terraform-fmt-prd
+          filters:
+            <<: *tags_only_filter
+      - persist-tf-env-vars:
+          name: persist-tf-env-vars-prd
+          image_tag: "${CIRCLE_TAG}"
+          env: prd
+          requires:
+            - setup-prd
+          filters:
+            <<: *tags_only_filter
+      - dvo-tfc/init-plan:
+          context:
+            - dvo-tools-tfc
+          name: init-plan-prd
+          requires:
+            - persist-tf-env-vars-prd
+          filters:
+            <<: *tags_only_filter
+      - notify-release:
+          name: notify-prd-release
+          context:
+            - slack-app-deployer-token
+          requires:
+            - init-plan-prd
+          filters:
+            <<: *tags_only_filter
+      - approve-prd-deploy:
+          type: approval
+          requires:
+            - init-plan-prd
+          filters:
+            <<: *tags_only_filter
+      - dvo-tfc/apply:
+          context:
+            - dvo-tools-tfc
+            - deploy-prd
+          name: apply-prd
+          requires:
+            - approve-prd-deploy
+          filters:
+            <<: *tags_only_filter
+      - notify-deploy:
+          name: notify-deploy-feature
+          context:
+            - slack-app-deployer-token
+          requires:
+            - apply-prd
+          filters:
+            <<: *tags_only_filter
